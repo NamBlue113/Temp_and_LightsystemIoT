@@ -1,0 +1,31 @@
+# ---- Thông tin bí mật: TUYỆT ĐỐI không đưa lên GitHub ----
+# (Wi-Fi, mật khẩu OTA, mật khẩu web, sau này là tài khoản MQTT)
+include/secrets.h
+secrets.h
+
+# ---- PlatformIO ----
+.pio/
+.vscode/
+.cache/
+
+# ---- File biên dịch / kiểm thử logic trên máy tính ----
+tools/test_logic
+tools/test_logic.exe
+*.o
+*.obj
+*.exe
+
+# ---- Log, file tạm ----
+*.log
+*.tmp
+*.bak
+
+# ---- File hệ điều hành / trình soạn thảo ----
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.idea/
+
+# ---- Claude Code (cấu hình cục bộ) ----
+.claude/
