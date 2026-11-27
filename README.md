@@ -57,14 +57,14 @@ Cứ 5 phút ESP32 ghi một mẫu (nhiệt độ, độ ẩm, ánh sáng) vào 
 Điện thoại ── trang web ──HTTPS──> Firebase Realtime Database <──HTTPS── ESP32
 ```
 
-1. Trong dự án Firebase: bật **Authentication → Email/Password**, tạo **hai người dùng** (một cho ESP32, một cho trang web) với mật khẩu mạnh, và tạo **Realtime Database**.
+1. Trong dự án Firebase: bật **Authentication → Email/Password**, tạo **một người dùng riêng cho ESP32** và **một hoặc nhiều người dùng cho trang web**, mật khẩu mạnh, và tạo **Realtime Database**.
 2. Điền `FIREBASE_API_KEY`, `FIREBASE_DB_HOST` vào `include/firebase_config.h` (thông tin công khai).
 3. Thêm `FIREBASE_EMAIL`, `FIREBASE_PASSWORD` (tài khoản của **ESP32**) vào `include/secrets.h`, rồi nạp lại.
-4. **Khóa cơ sở dữ liệu:** thay hai UID trong `database.rules.json` bằng UID của hai tài khoản trên, rồi dán vào Realtime Database → Rules → **Publish**.
+4. **Khóa cơ sở dữ liệu:** thay các UID trong `database.rules.json` bằng UID của các tài khoản trên (UID của ESP32 và của từng người dùng web), rồi dán vào Realtime Database → Rules → **Publish**.
 5. Đưa trang web lên mạng (chọn một cách):
    - Firebase Hosting: cài Firebase CLI, `firebase login`, rồi `firebase deploy` (đăng cả luật bảo mật và thư mục `docs/`). Trang ở `https://<project-id>.web.app`.
    - GitHub Pages: Settings → Pages → Deploy from a branch → `main` / `/docs`.
-6. Mở trang trên điện thoại, đăng nhập bằng tài khoản dành cho **trang web**.
+6. Mở trang trên điện thoại, đăng nhập bằng một tài khoản dành cho **trang web** (tài khoản của ESP32 không đọc được phản hồi nên không dùng ở đây).
 
 | Nhánh dữ liệu | Nội dung | Ai ghi |
 |---|---|---|

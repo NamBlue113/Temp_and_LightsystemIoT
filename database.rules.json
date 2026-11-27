@@ -3,16 +3,16 @@
     "devices": {
       "esp32_01": {
         "state": {
-          ".read": "auth.uid === 'Qlg5q3chb8TCXCvRyLwCQokza4j2' || auth.uid === 'KfA9GLkG13Uh82nBZgKtnRze3Cj2'",
-          ".write": "auth.uid === 'KfA9GLkG13Uh82nBZgKtnRze3Cj2'"
+          ".read": "auth.uid === 'KfA9GLkG13Uh82nBZgKtnRze3Cj2' || auth.uid === 'Qlg5q3chb8TCXCvRyLwCQokza4j2' || auth.uid === 'xxoIQFJ0IBTXZJYhbfhtuO9f47h2'",
+          ".write": "auth.uid === 'xxoIQFJ0IBTXZJYhbfhtuO9f47h2'"
         },
         "cmd": {
-          ".read": "auth.uid === 'KfA9GLkG13Uh82nBZgKtnRze3Cj2'",
-          ".write": "auth.uid === 'Qlg5q3chb8TCXCvRyLwCQokza4j2' || auth.uid === 'KfA9GLkG13Uh82nBZgKtnRze3Cj2'"
+          ".read": "auth.uid === 'xxoIQFJ0IBTXZJYhbfhtuO9f47h2'",
+          ".write": "auth.uid === 'KfA9GLkG13Uh82nBZgKtnRze3Cj2' || auth.uid === 'Qlg5q3chb8TCXCvRyLwCQokza4j2' || auth.uid === 'xxoIQFJ0IBTXZJYhbfhtuO9f47h2'"
         },
         "reply": {
-          ".read": "auth.uid === 'Qlg5q3chb8TCXCvRyLwCQokza4j2'",
-          ".write": "auth.uid === 'Qlg5q3chb8TCXCvRyLwCQokza4j2' || auth.uid === 'KfA9GLkG13Uh82nBZgKtnRze3Cj2'"
+          ".read": "auth.uid === 'KfA9GLkG13Uh82nBZgKtnRze3Cj2' || auth.uid === 'Qlg5q3chb8TCXCvRyLwCQokza4j2'",
+          ".write": "auth.uid === 'KfA9GLkG13Uh82nBZgKtnRze3Cj2' || auth.uid === 'Qlg5q3chb8TCXCvRyLwCQokza4j2' || auth.uid === 'xxoIQFJ0IBTXZJYhbfhtuO9f47h2'"
         }
       }
     }
