@@ -1,0 +1,20 @@
+{
+  "rules": {
+    "devices": {
+      "esp32_01": {
+        "state": {
+          ".read": "auth.uid === 'Qlg5q3chb8TCXCvRyLwCQokza4j2' || auth.uid === 'KfA9GLkG13Uh82nBZgKtnRze3Cj2'",
+          ".write": "auth.uid === 'KfA9GLkG13Uh82nBZgKtnRze3Cj2'"
+        },
+        "cmd": {
+          ".read": "auth.uid === 'KfA9GLkG13Uh82nBZgKtnRze3Cj2'",
+          ".write": "auth.uid === 'Qlg5q3chb8TCXCvRyLwCQokza4j2' || auth.uid === 'KfA9GLkG13Uh82nBZgKtnRze3Cj2'"
+        },
+        "reply": {
+          ".read": "auth.uid === 'Qlg5q3chb8TCXCvRyLwCQokza4j2'",
+          ".write": "auth.uid === 'Qlg5q3chb8TCXCvRyLwCQokza4j2' || auth.uid === 'KfA9GLkG13Uh82nBZgKtnRze3Cj2'"
+        }
+      }
+    }
+  }
+}

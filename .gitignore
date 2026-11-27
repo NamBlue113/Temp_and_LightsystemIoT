@@ -2,6 +2,7 @@
 # (Wi-Fi, mật khẩu OTA, mật khẩu web, sau này là tài khoản MQTT)
 include/secrets.h
 secrets.h
+firebase.txt
 
 # ---- PlatformIO ----
 .pio/
@@ -29,3 +30,11 @@ desktop.ini
 
 # ---- Claude Code (cấu hình cục bộ) ----
 .claude/
+
+# ---- Firebase CLI ----
+.firebase/
+firebase-debug.log
+
+# ---- Báo cáo (chỉ giữ trên máy) ----
+*.docx
+~$*

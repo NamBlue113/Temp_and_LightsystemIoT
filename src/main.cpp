@@ -1,5 +1,5 @@
 /*
- * Smartroom ESP32 - Giai đoạn 1: phần cứng chạy hoàn chỉnh (chưa MQTT/backend)
+ * Smartroom ESP32
  *
  *  - DHT11: nhiệt độ + độ ẩm
  *  - Quạt 5V qua module MOSFET, PWM nhiều mức; tự động theo nhiệt độ HOẶC độ ẩm (có hysteresis)
@@ -8,6 +8,9 @@
  *  - LED trạng thái (xanh dương): mã nháy theo độ ưu tiên
  *  - Lưu cấu hình vào flash (NVS), cập nhật firmware OTA
  *  - Giao diện web + REST API cục bộ, lệnh Serial để kiểm thử
+ *  - Đổi mạng Wi-Fi từ điện thoại qua Wi-Fi riêng của ESP32 (xem net.cpp)
+ *  - Lịch sử cảm biến lưu flash, xuất CSV (xem history.cpp)
+ *  - Điều khiển từ xa qua Firebase (xem remote.cpp)
  */
 #include <Arduino.h>
 #include <WiFi.h>
@@ -36,6 +39,10 @@
 #error "Thieu WEB_PASSWORD - hay them dong #define WEB_PASSWORD \"...\" vao include/secrets.h (xem secrets.example.h)"
 #endif
 #include "web_page.h"
+#include "wifi_page.h"
+#include "net.h"
+#include "history.h"
+#include "remote.h"
 
 // =====================================================================
 //  Trạng thái toàn cục
@@ -79,10 +86,8 @@ static bool          g_rtcFound = false;
 static volatile bool g_ntpSynced = false;
 
 // Mạng
-static bool     g_servicesStarted = false;
-static uint32_t g_lastWifiAttemptMs = 0;
+static bool     g_otaStarted = false;
 static bool     g_otaActive = false;
-static bool     g_backendOk = false;     // giai đoạn sau: MQTT/backend
 
 // LED trạng thái
 static logic::StatusPattern g_pattern = logic::StatusPattern::Normal;
@@ -97,13 +102,6 @@ static bool g_isDark = false;    // phòng đang tối?
 static int g_lightDarkLevel   = LIGHT_DARK_LEVEL;
 static int g_lightBrightLevel = LIGHT_BRIGHT_LEVEL;
 static int g_lightLevel       = 0;
-
-// Lịch sử cho biểu đồ (vòng tròn)
-struct HistSample { int16_t t10; uint8_t h; uint16_t light; };
-static HistSample g_hist[HIST_MAX];
-static int        g_histCount = 0;
-static int        g_histHead  = 0;        // vị trí ghi tiếp theo
-static uint32_t   g_histLastTs = 0;       // thời điểm (epoch) của mẫu mới nhất
 
 // Chống dò mật khẩu web
 static uint8_t  g_authFails = 0;
@@ -379,21 +377,25 @@ static void handleLight(uint32_t now) {
 // =====================================================================
 //  Cập nhật ngõ ra
 // =====================================================================
-// Ghi 1 mẫu (nhiệt độ, độ ẩm, ánh sáng) mỗi HIST_INTERVAL_MS để vẽ biểu đồ.
+// Ghi 1 mẫu (nhiệt độ, độ ẩm, ánh sáng) mỗi HIST_INTERVAL_S giây để vẽ biểu đồ.
 // Không ghi khi đang giả lập hoặc cảm biến lỗi hoặc chưa có giờ hợp lệ.
 static void handleHistory(uint32_t now) {
-  static uint32_t last = 0;
-  static bool any = false;
-  if (any && (uint32_t)(now - last) < HIST_INTERVAL_MS) return;
+  static uint32_t lastCheck = 0;
+  if ((uint32_t)(now - lastCheck) < 1000) return;
+  lastCheck = now;
   if (g_simActive || g_dhtError || !g_haveReading || g_lightPct < 0 || !timeIsValid()) return;
-  any = true;
-  last = now;
-  g_hist[g_histHead].t10 = (int16_t)lroundf(g_temp * 10.0f);
-  g_hist[g_histHead].h = (uint8_t)constrain((int)lroundf(g_hum), 0, 100);
-  g_hist[g_histHead].light = (uint16_t)constrain(g_lightLevel, 0, 4095);
-  g_histHead = (g_histHead + 1) % HIST_MAX;
-  if (g_histCount < HIST_MAX) g_histCount++;
-  g_histLastTs = (uint32_t)time(nullptr);
+  // So theo giờ thật để khởi động lại nhiều lần không ghi mẫu dày hơn chu kỳ.
+  // Nếu giờ bị chỉnh lùi hơn 1 giờ thì ghi tiếp bình thường.
+  uint32_t t = (uint32_t)time(nullptr);
+  uint32_t last = history::lastTs();
+  if (last != 0 && t >= last && t - last < HIST_INTERVAL_S) return;
+  if (last != 0 && t < last && last - t < 3600) return;
+  history::Sample s;
+  s.ts = t;
+  s.t10 = (int16_t)lroundf(g_temp * 10.0f);
+  s.h = (uint8_t)constrain((int)lroundf(g_hum), 0, 100);
+  s.light = (uint16_t)constrain(g_lightLevel, 0, 4095);
+  history::add(s);
 }
 
 static void updateOutputs(uint32_t now) {
@@ -434,8 +436,8 @@ static void updateStatusLed(uint32_t now) {
   in.rtcFault       = (!g_rtcFound || !timeIsValid());
   in.overThreshold  = !g_dhtError && g_haveReading && (fanState.tempHot || fanState.humHigh);
   in.wifiConnecting = (WiFi.status() != WL_CONNECTED);
-  in.backendEnabled = BACKEND_ENABLED;
-  in.backendLost    = !g_backendOk;
+  in.backendEnabled = remote::enabled();
+  in.backendLost    = !remote::connected();
 
   logic::StatusPattern pat = logic::pickStatusPattern(in);
   if (pat != g_pattern) {
@@ -499,10 +501,19 @@ static void updateLcd(uint32_t now) {
     snprintf(hhmm, sizeof(hhmm), "%02d:%02d", lt.tm_hour, lt.tm_min);
   }
   // LCD không có dấu tiếng Việt nên dùng chữ không dấu
-  if (g_dhtError)          snprintf(line[0], sizeof(line[0]), "DHT loi    %s", hhmm);
-  else if (!g_haveReading) snprintf(line[0], sizeof(line[0]), "Dang doc.. %s", hhmm);
-  else                     snprintf(line[0], sizeof(line[0]), "%4.1fC %2.0f%% %s", g_temp, g_hum, hhmm);
-  snprintf(line[1], sizeof(line[1]), "Fan:%3d%% Led:%s", g_fanPercent, g_ledOutput ? "ON" : "OFF");
+  // Vừa kết nối: hiện địa chỉ IP. Đang phát Wi-Fi riêng: xen kẽ 4 giây hướng dẫn / 4 giây số liệu.
+  if (net::connected() && net::connectedAt() != 0 && (uint32_t)(millis() - net::connectedAt()) < LCD_SHOW_IP_MS) {
+    snprintf(line[0], sizeof(line[0]), "WiFi OK");
+    snprintf(line[1], sizeof(line[1]), "%s", WiFi.localIP().toString().c_str());
+  } else if (net::portalActive() && !net::connected() && (now / 4000) % 2 == 0) {
+    snprintf(line[0], sizeof(line[0]), "%s", SETUP_AP_SSID);
+    snprintf(line[1], sizeof(line[1]), "%s", WiFi.softAPIP().toString().c_str());
+  } else {
+    if (g_dhtError)          snprintf(line[0], sizeof(line[0]), "DHT loi    %s", hhmm);
+    else if (!g_haveReading) snprintf(line[0], sizeof(line[0]), "Dang doc.. %s", hhmm);
+    else                     snprintf(line[0], sizeof(line[0]), "%4.1fC %2.0f%% %s", g_temp, g_hum, hhmm);
+    snprintf(line[1], sizeof(line[1]), "Fan:%3d%% Led:%s", g_fanPercent, g_ledOutput ? "ON" : "OFF");
+  }
 
   for (int r = 0; r < 2; r++) {
     char buf[LCD_COLS + 1];
@@ -569,6 +580,8 @@ static String statusJson() {
   JsonDocument d;
   d["fw"] = FW_VERSION;
   d["uptime_s"] = millis() / 1000;
+  d["heap_free"] = ESP.getFreeHeap();
+  d["heap_min"] = ESP.getMinFreeHeap();
 
   char tbuf[24];
   formatLocalTime(tbuf, sizeof(tbuf));
@@ -581,7 +594,10 @@ static String statusJson() {
   JsonObject w = d["wifi"].to<JsonObject>();
   bool conn = (WiFi.status() == WL_CONNECTED);
   w["connected"] = conn;
+  w["portal"] = net::portalActive();
+  w["setup_ssid"] = SETUP_AP_SSID;
   if (conn) {
+    w["ssid"] = WiFi.SSID();
     w["rssi"] = WiFi.RSSI();
     w["ip"] = WiFi.localIP().toString();
   }
@@ -623,6 +639,14 @@ static String statusJson() {
   c["temp_off"] = params.tempOff;
   c["hum_on"] = params.humOn;
   c["hum_off"] = params.humOff;
+
+  JsonObject cl = d["cloud"].to<JsonObject>();
+  cl["enabled"] = remote::enabled();
+  cl["connected"] = remote::connected();
+
+  JsonObject hi = d["history"].to<JsonObject>();
+  hi["flash"] = history::flashOk();
+  hi["samples"] = history::count();
 
   d["status_led"] = logic::statusPatternName(g_pattern);
 
@@ -725,99 +749,69 @@ static bool readBody(JsonDocument& doc) {
   return !e;
 }
 
-static void handleApiStatus() {
-  if (!authOk()) return;
-  sendJson(200, statusJson());
+// ---------------------------------------------------------------------
+//  Lệnh dùng chung cho REST và Firebase. Trả về false và đặt *err nếu dữ liệu sai.
+// ---------------------------------------------------------------------
+static bool cmdFan(JsonVariantConst d, const char** err) {
+  const char* mode = d["mode"] | "";
+  if (strcmp(mode, "auto") == 0) { setFanAuto(); return true; }
+  if (strcmp(mode, "manual") != 0) { *err = "mode phai la auto hoac manual"; return false; }
+  int p = d["percent"] | -1;
+  if (p < 0 || p > 100) { *err = "percent phai trong 0..100"; return false; }
+  setFanManual(p);
+  return true;
 }
 
-static void handleApiLight() {
-  if (!authOk()) return;
-  JsonDocument d;
-  if (!readBody(d)) { sendErr(400, "JSON khong hop le"); return; }
+static bool cmdLed(JsonVariantConst d, const char** err) {
+  const char* mode = d["mode"] | "";
+  if (strcmp(mode, "auto") == 0) { setLedAuto(); return true; }
+  if (strcmp(mode, "manual") != 0) { *err = "mode phai la auto hoac manual"; return false; }
+  if (!d["on"].is<bool>()) { *err = "thieu truong on (true/false)"; return false; }
+  setLedManual(d["on"].as<bool>());
+  return true;
+}
+
+static bool cmdConfig(JsonVariantConst d, const char** err) {
+  float tOn  = d["temp_on"]  | params.tempOn;
+  float tOff = d["temp_off"] | params.tempOff;
+  float hOn  = d["hum_on"]   | params.humOn;
+  float hOff = d["hum_off"]  | params.humOff;
+  return applyThresholds(tOn, tOff, hOn, hOff, err);
+}
+
+static bool cmdLight(JsonVariantConst d, const char** err) {
   int dk = d["dark"] | g_lightDarkLevel;
   int br = d["bright"] | g_lightBrightLevel;
-  if (dk < 0 || br > 4095 || dk + 20 > br) { sendErr(400, "Nguong TOI phai nho hon nguong SANG it nhat 20 (0..4095)"); return; }
+  if (dk < 0 || br > 4095 || dk + 20 > br) { *err = "Nguong TOI phai nho hon nguong SANG it nhat 20 (0..4095)"; return false; }
   g_lightDarkLevel = dk;
   g_lightBrightLevel = br;
   saveLight();
   g_ledDirty = true;
   Serial.printf("[ánh sáng] ngưỡng: tối <= %d, sáng >= %d\n", dk, br);
-  sendOk();
+  return true;
 }
 
-// Lịch sử: mảng cũ -> mới, cách nhau interval giây, mẫu mới nhất ở thời điểm "end" (epoch)
-static void handleApiHistory() {
-  if (!authOk()) return;
-  JsonDocument d;
-  d["interval"] = HIST_INTERVAL_MS / 1000;
-  d["end"] = g_histLastTs;
-  d["n"] = g_histCount;
-  JsonArray t = d["t"].to<JsonArray>();
-  JsonArray h = d["h"].to<JsonArray>();
-  JsonArray l = d["l"].to<JsonArray>();
-  int start = (g_histHead - g_histCount + HIST_MAX) % HIST_MAX;
-  for (int i = 0; i < g_histCount; i++) {
-    const HistSample& s = g_hist[(start + i) % HIST_MAX];
-    t.add(s.t10 / 10.0f);
-    h.add(s.h);
-    l.add(s.light);
+static bool cmdScheduleSet(JsonVariantConst d, const char** err) {
+  if (!d["slots"].is<JsonArrayConst>()) { *err = "thieu mang slots"; return false; }
+  JsonArrayConst arr = d["slots"].as<JsonArrayConst>();
+  if ((int)arr.size() > MAX_SLOTS) { *err = "qua nhieu khung gio (toi da 6)"; return false; }
+  logic::Slot tmp[MAX_SLOTS];     // khung không được gửi lên sẽ là tắt
+  int i = 0;
+  for (JsonObjectConst o : arr) {
+    uint16_t a, b;
+    if (!logic::parseHHMM(o["start"] | "", a) || !logic::parseHHMM(o["end"] | "", b)) {
+      *err = "gio phai co dang HH:MM";
+      return false;
+    }
+    tmp[i].enabled = o["enabled"] | false;
+    tmp[i].startMin = a;
+    tmp[i].endMin = b;
+    i++;
   }
-  String out;
-  serializeJson(d, out);
-  sendJson(200, out);
+  return applySlots(tmp, err);
 }
 
-static void handleApiFan() {
-  if (!authOk()) return;
-  JsonDocument d;
-  if (!readBody(d)) { sendErr(400, "JSON khong hop le"); return; }
-  const char* mode = d["mode"] | "";
-  if (strcmp(mode, "auto") == 0) {
-    setFanAuto();
-  } else if (strcmp(mode, "manual") == 0) {
-    int p = d["percent"] | -1;
-    if (p < 0 || p > 100) { sendErr(400, "percent phai trong 0..100"); return; }
-    setFanManual(p);
-  } else {
-    sendErr(400, "mode phai la auto hoac manual");
-    return;
-  }
-  sendOk();
-}
-
-static void handleApiLed() {
-  if (!authOk()) return;
-  JsonDocument d;
-  if (!readBody(d)) { sendErr(400, "JSON khong hop le"); return; }
-  const char* mode = d["mode"] | "";
-  if (strcmp(mode, "auto") == 0) {
-    setLedAuto();
-  } else if (strcmp(mode, "manual") == 0) {
-    if (!d["on"].is<bool>()) { sendErr(400, "thieu truong on (true/false)"); return; }
-    setLedManual(d["on"].as<bool>());
-  } else {
-    sendErr(400, "mode phai la auto hoac manual");
-    return;
-  }
-  sendOk();
-}
-
-static void handleApiConfig() {
-  if (!authOk()) return;
-  JsonDocument d;
-  if (!readBody(d)) { sendErr(400, "JSON khong hop le"); return; }
-  float tOn  = d["temp_on"]  | params.tempOn;
-  float tOff = d["temp_off"] | params.tempOff;
-  float hOn  = d["hum_on"]   | params.humOn;
-  float hOff = d["hum_off"]  | params.humOff;
-  const char* err = nullptr;
-  if (!applyThresholds(tOn, tOff, hOn, hOff, &err)) { sendErr(400, err); return; }
-  sendOk();
-}
-
-static void handleApiScheduleGet() {
-  if (!authOk()) return;
-  JsonDocument d;
+static void fillSchedule(JsonDocument& d) {
   JsonArray arr = d["slots"].to<JsonArray>();
   char a[6], b[6];
   for (int i = 0; i < MAX_SLOTS; i++) {
@@ -828,35 +822,109 @@ static void handleApiScheduleGet() {
     o["start"] = String(a);
     o["end"] = String(b);
   }
+}
+
+// Lịch sử 24 giờ gần nhất: mảng cũ -> mới, "ts" là thời điểm (epoch) của từng mẫu
+static void fillHistory(JsonDocument& d) {
+  uint32_t from = timeIsValid() ? (uint32_t)time(nullptr) - 86400UL : 0;
+  d["interval"] = HIST_INTERVAL_S;
+  JsonArray ts = d["ts"].to<JsonArray>();
+  JsonArray t = d["t"].to<JsonArray>();
+  JsonArray h = d["h"].to<JsonArray>();
+  JsonArray l = d["l"].to<JsonArray>();
+  int n = 0;
+  uint32_t end = 0;
+  for (int i = 0; i < history::count(); i++) {
+    const history::Sample& s = history::at(i);
+    if (s.ts < from) continue;
+    ts.add(s.ts);
+    t.add(serialized(String(s.t10 / 10.0f, 1)));
+    h.add(s.h);
+    l.add(s.light);
+    end = s.ts;
+    n++;
+  }
+  d["n"] = n;
+  d["end"] = end;
+}
+
+// ---------------------------------------------------------------------
+//  REST handler
+// ---------------------------------------------------------------------
+static void handleApiStatus() {
+  if (!authOk()) return;
+  sendJson(200, statusJson());
+}
+
+static void handleCommand(bool (*fn)(JsonVariantConst, const char**)) {
+  if (!authOk()) return;
+  JsonDocument d;
+  if (!readBody(d)) { sendErr(400, "JSON khong hop le"); return; }
+  const char* err = nullptr;
+  if (!fn(d.as<JsonVariantConst>(), &err)) { sendErr(400, err); return; }
+  sendOk();
+}
+
+static void sendDoc(const JsonDocument& d) {
   String out;
   serializeJson(d, out);
   sendJson(200, out);
 }
 
-static void handleApiSchedulePost() {
+static void handleApiHistory() {
   if (!authOk()) return;
   JsonDocument d;
-  if (!readBody(d)) { sendErr(400, "JSON khong hop le"); return; }
-  if (!d["slots"].is<JsonArray>()) { sendErr(400, "thieu mang slots"); return; }
-  JsonArray arr = d["slots"].as<JsonArray>();
-  if ((int)arr.size() > MAX_SLOTS) { sendErr(400, "qua nhieu khung gio (toi da 6)"); return; }
+  fillHistory(d);
+  sendDoc(d);
+}
 
-  logic::Slot tmp[MAX_SLOTS];     // khung không được gửi lên sẽ là tắt
-  int i = 0;
-  for (JsonObject o : arr) {
-    uint16_t a, b;
-    if (!logic::parseHHMM(o["start"] | "", a) || !logic::parseHHMM(o["end"] | "", b)) {
-      sendErr(400, "gio phai co dang HH:MM");
-      return;
-    }
-    tmp[i].enabled = o["enabled"] | false;
-    tmp[i].startMin = a;
-    tmp[i].endMin = b;
-    i++;
+// Xuất CSV toàn bộ dữ liệu trong flash (hoặc ?days=N ngày gần nhất), gửi theo từng khối
+struct CsvCtx { String buf; uint32_t rows; };
+
+static void csvRow(const history::Sample& s, void* p) {
+  CsvCtx* c = static_cast<CsvCtx*>(p);
+  time_t t = (time_t)s.ts;
+  struct tm lt;
+  localtime_r(&t, &lt);
+  char when[24], row[80];
+  strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", &lt);
+  snprintf(row, sizeof(row), "%s,%lu,%.1f,%u,%u\r\n", when, (unsigned long)s.ts,
+           s.t10 / 10.0f, (unsigned)s.h, (unsigned)s.light);
+  c->buf += row;
+  c->rows++;
+  if (c->buf.length() >= 1400) {
+    server.sendContent(c->buf);
+    c->buf = "";
   }
-  const char* err = nullptr;
-  if (!applySlots(tmp, &err)) { sendErr(400, err); return; }
-  sendOk();
+}
+
+static void handleApiHistoryCsv() {
+  if (!authOk()) return;
+  uint32_t from = 0;
+  int days = server.arg("days").toInt();
+  if (days > 0 && days <= HIST_KEEP_DAYS && timeIsValid()) from = (uint32_t)time(nullptr) - (uint32_t)days * 86400UL;
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Content-Disposition", "attachment; filename=\"smartroom-history.csv\"");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv; charset=utf-8", "");
+  CsvCtx c;
+  c.rows = 0;
+  c.buf.reserve(1600);
+  c.buf = "thoi_gian,epoch,nhiet_do_c,do_am_pct,anh_sang\r\n";
+  if (history::flashOk()) {
+    history::forEachStored(from, csvRow, &c);
+  } else {
+    for (int i = 0; i < history::count(); i++) csvRow(history::at(i), &c);
+  }
+  if (c.buf.length()) server.sendContent(c.buf);
+  server.sendContent("");
+}
+
+static void handleApiScheduleGet() {
+  if (!authOk()) return;
+  JsonDocument d;
+  fillSchedule(d);
+  sendDoc(d);
 }
 
 static void handleApiSim() {
@@ -876,26 +944,141 @@ static void handleApiSim() {
   sendOk();
 }
 
+// ---------------------------------------------------------------------
+//  Cài đặt Wi-Fi: chỉ nhận yêu cầu đến từ thiết bị đang nối vào Wi-Fi riêng
+//  (đã phải biết mật khẩu của Wi-Fi riêng), nên không dùng thêm mật khẩu web.
+// ---------------------------------------------------------------------
+static bool fromSetupAp() {
+  if (!net::portalActive()) return false;
+  IPAddress ap = WiFi.softAPIP();
+  IPAddress local = server.client().localIP();
+  IPAddress remote = server.client().remoteIP();
+  return local == ap && remote[0] == ap[0] && remote[1] == ap[1] && remote[2] == ap[2];
+}
+
+static bool requireSetupAp() {
+  if (fromSetupAp()) return true;
+  sendErr(403, "Chi dung duoc khi noi vao Wi-Fi cai dat cua thiet bi");
+  return false;
+}
+
+static void sendPage(const char* html) {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "text/html; charset=utf-8", html);
+}
+
+static void handleApiWifiInfo() {
+  if (!requireSetupAp()) return;
+  JsonDocument d;
+  bool conn = net::connected();
+  d["connected"] = conn;
+  d["current"] = conn ? WiFi.SSID() : String();
+  d["ip"] = conn ? WiFi.localIP().toString() : String();
+  const char* st = "idle";
+  switch (net::trialState()) {
+    case net::Trial::Connecting: st = "connecting"; break;
+    case net::Trial::Ok:         st = "ok";         break;
+    case net::Trial::Fail:       st = "fail";       break;
+    default: break;
+  }
+  d["state"] = st;
+  d["target"] = net::trialSsid();
+  JsonArray saved = d["saved"].to<JsonArray>();
+  for (int i = 0; i < net::savedCount(); i++) saved.add(net::savedSsid(i));
+  String out;
+  serializeJson(d, out);
+  sendJson(200, out);
+}
+
+static void handleApiWifiScan() {
+  if (!requireSetupAp()) return;
+  if (server.hasArg("new")) net::requestScan();
+  JsonDocument d;
+  d["scanning"] = net::scanning();
+  JsonArray arr = d["list"].to<JsonArray>();
+  for (int i = 0; i < net::scanCount(); i++) {
+    const net::ScanItem& it = net::scanItem(i);
+    JsonObject o = arr.add<JsonObject>();
+    o["ssid"] = it.ssid;
+    o["rssi"] = it.rssi;
+    o["open"] = it.open;
+  }
+  String out;
+  serializeJson(d, out);
+  sendJson(200, out);
+}
+
+static void handleApiWifiConnect() {
+  if (!requireSetupAp()) return;
+  JsonDocument d;
+  if (!readBody(d)) { sendErr(400, "JSON khong hop le"); return; }
+  const char* err = nullptr;
+  if (!net::requestConnect(d["ssid"] | "", d["password"] | "", &err)) { sendErr(400, err); return; }
+  sendOk();
+}
+
+static void handleApiWifiSave() {
+  if (!requireSetupAp()) return;
+  JsonDocument d;
+  if (!readBody(d)) { sendErr(400, "JSON khong hop le"); return; }
+  const char* err = nullptr;
+  if (!net::saveForLater(d["ssid"] | "", d["password"] | "", &err)) { sendErr(400, err); return; }
+  sendOk();
+}
+
+static void handleApiWifiForget() {
+  if (!requireSetupAp()) return;
+  JsonDocument d;
+  if (!readBody(d)) { sendErr(400, "JSON khong hop le"); return; }
+  if (!net::forgetNetwork(d["ssid"] | "")) { sendErr(404, "khong co mang nay"); return; }
+  sendOk();
+}
+
+// Mở Wi-Fi riêng từ dashboard (đang ở mạng LAN) - cần mật khẩu web
+static void handleApiWifiPortal() {
+  if (!authOk()) return;
+  net::openPortal();
+  sendOk();
+}
+
+static void handleNotFound() {
+  // Điện thoại vừa nối vào Wi-Fi riêng sẽ thử tải một địa chỉ bất kỳ -> chuyển về trang cài đặt
+  if (fromSetupAp() && server.method() == HTTP_GET && !server.uri().startsWith("/api/")) {
+    server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/");
+    server.send(302, "text/plain", "");
+    return;
+  }
+  sendErr(404, "khong tim thay");
+}
+
 static void setupWeb() {
   static const char* kHeaders[] = {"X-Auth"};
   server.collectHeaders(kHeaders, 1);
-  server.on("/", HTTP_GET, []() { server.send_P(200, "text/html; charset=utf-8", INDEX_HTML); });
+  server.on("/", HTTP_GET, []() { sendPage(fromSetupAp() ? WIFI_HTML : INDEX_HTML); });
+  server.on("/dashboard", HTTP_GET, []() { sendPage(INDEX_HTML); });
+  server.on("/api/wifi/info", HTTP_GET, handleApiWifiInfo);
+  server.on("/api/wifi/scan", HTTP_GET, handleApiWifiScan);
+  server.on("/api/wifi/connect", HTTP_POST, handleApiWifiConnect);
+  server.on("/api/wifi/portal", HTTP_POST, handleApiWifiPortal);
+  server.on("/api/wifi/save", HTTP_POST, handleApiWifiSave);
+  server.on("/api/wifi/forget", HTTP_POST, handleApiWifiForget);
   server.on("/manifest.json", HTTP_GET, []() { server.send_P(200, "application/manifest+json", MANIFEST_JSON); });
-  server.on("/api/light", HTTP_POST, handleApiLight);
+  server.on("/api/light", HTTP_POST, []() { handleCommand(cmdLight); });
   server.on("/api/history", HTTP_GET, handleApiHistory);
+  server.on("/api/history.csv", HTTP_GET, handleApiHistoryCsv);
   server.on("/api/status", HTTP_GET, handleApiStatus);
-  server.on("/api/fan", HTTP_POST, handleApiFan);
-  server.on("/api/led", HTTP_POST, handleApiLed);
-  server.on("/api/config", HTTP_POST, handleApiConfig);
+  server.on("/api/fan", HTTP_POST, []() { handleCommand(cmdFan); });
+  server.on("/api/led", HTTP_POST, []() { handleCommand(cmdLed); });
+  server.on("/api/config", HTTP_POST, []() { handleCommand(cmdConfig); });
   server.on("/api/schedule", HTTP_GET, handleApiScheduleGet);
-  server.on("/api/schedule", HTTP_POST, handleApiSchedulePost);
+  server.on("/api/schedule", HTTP_POST, []() { handleCommand(cmdScheduleSet); });
   server.on("/api/sim", HTTP_POST, handleApiSim);
-  server.onNotFound([]() { sendErr(404, "khong tim thay"); });
+  server.onNotFound(handleNotFound);
   server.begin();
 }
 
 // =====================================================================
-//  Wi-Fi + OTA
+//  OTA (Wi-Fi do net.cpp quản lý)
 // =====================================================================
 static void setupOta() {
   ArduinoOTA.setHostname(DEVICE_HOSTNAME);
@@ -919,27 +1102,70 @@ static void setupOta() {
   ArduinoOTA.begin();
 }
 
-static void startServices() {
-  Serial.printf("[wifi] đã kết nối, IP = %s\n", WiFi.localIP().toString().c_str());
-  setupOta();
-  setupWeb();
-  g_servicesStarted = true;
+// In địa chỉ mỗi lần có kết nối mới; OTA + mDNS khởi động ở lần kết nối đầu tiên
+static void handleServices() {
+  static uint32_t seen = 0;
+  if (!net::connected() || net::connectedAt() == seen) return;
+  seen = net::connectedAt();
+  if (!g_otaStarted) {
+    setupOta();
+    g_otaStarted = true;
+  }
+  Serial.printf("[wifi] đã kết nối \"%s\", IP = %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
   Serial.printf("[web] http://%s.local/  hoặc  http://%s/\n", DEVICE_HOSTNAME, WiFi.localIP().toString().c_str());
 }
 
-static void handleWifi(uint32_t now) {
-  static uint32_t lastCheck = 0;
-  if ((uint32_t)(now - lastCheck) < 500) return;
-  lastCheck = now;
-
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!g_servicesStarted) startServices();
-  } else if ((uint32_t)(now - g_lastWifiAttemptMs) >= WIFI_RETRY_MS) {
-    g_lastWifiAttemptMs = now;
-    Serial.println(F("[wifi] chưa kết nối, thử lại..."));
-    WiFi.disconnect();
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+// =====================================================================
+//  Điều khiển từ xa qua Firebase. Không nhận lệnh giả lập cảm biến hay đổi Wi-Fi.
+// =====================================================================
+static String runRemoteCommand(const String& payload, bool* changed) {
+  *changed = false;
+  JsonDocument in, out;
+  const char* err = nullptr;
+  bool ok = false;
+  if (deserializeJson(in, payload)) {
+    err = "JSON khong hop le";
+  } else {
+    out["id"] = in["id"] | "";
+    const char* op = in["op"] | "";
+    JsonVariantConst body = in["body"];
+    if      (!strcmp(op, "fan"))          { ok = cmdFan(body, &err); *changed = ok; }
+    else if (!strcmp(op, "led"))          { ok = cmdLed(body, &err); *changed = ok; }
+    else if (!strcmp(op, "config"))       { ok = cmdConfig(body, &err); *changed = ok; }
+    else if (!strcmp(op, "light"))        { ok = cmdLight(body, &err); *changed = ok; }
+    else if (!strcmp(op, "schedule_set")) { ok = cmdScheduleSet(body, &err); *changed = ok; }
+    else if (!strcmp(op, "schedule_get")) { fillSchedule(out); ok = true; }
+    else if (!strcmp(op, "history"))      { fillHistory(out); ok = true; }
+    else                                  { err = "lenh khong ho tro"; }
   }
+  out["ok"] = ok;
+  if (!ok) out["error"] = err ? err : "loi khong ro";
+  String s;
+  serializeJson(out, s);
+  return s;
+}
+
+static void handleRemote(uint32_t now) {
+  static uint32_t lastState = 0;
+  static bool wasOnline = false;
+  remote::poll();
+  bool publishNow = false;
+  String payload;
+  if (remote::popCommand(payload)) {
+    bool changed = false;
+    String reply = runRemoteCommand(payload, &changed);
+    if (changed) {
+      updateOutputs(millis());       // áp dụng ngay để trạng thái gửi đi là trạng thái mới
+      publishNow = true;
+    }
+    remote::publishReply(reply);
+  }
+  bool online = remote::connected();
+  if (online && (!wasOnline || publishNow || (uint32_t)(now - lastState) >= CLOUD_STATE_INTERVAL_MS)) {
+    lastState = now;
+    remote::publishState(statusJson());
+  }
+  wasOnline = online;
 }
 
 // =====================================================================
@@ -957,6 +1183,11 @@ static void printHelp() {
     "  sched <1..6> off             tắt một khung giờ\n"
     "  sim <nhiệt_độ> <độ_ẩm>       giả lập giá trị cảm biến (để thử quạt)\n"
     "  sim off                      tắt giả lập\n"
+    "  wifi                         xem các mạng đã nhớ\n"
+    "  wifi setup                   phát Wi-Fi riêng để đổi mạng từ điện thoại\n"
+    "  wifi forget                  xóa các mạng đã nhớ\n"
+    "  hist                         xem dung lượng lịch sử trong flash\n"
+    "  hist clear                   xóa toàn bộ lịch sử\n"
     "  reboot                       khởi động lại"));
 }
 
@@ -1037,6 +1268,54 @@ static void processCommand(char* line) {
     } else {
       Serial.println(F("sim: dùng 'sim <nhiệt_độ> <độ_ẩm>' hoặc 'sim off'"));
     }
+  } else if (!strcmp(c, "wifi")) {
+    if (n == 1) {
+      Serial.printf("  đang dùng: %s | Wi-Fi riêng: %s\n",
+                    net::connected() ? WiFi.SSID().c_str() : "chưa kết nối", net::portalActive() ? "BẬT" : "tắt");
+      for (int i = 0; i < net::savedCount(); i++) Serial.printf("  đã nhớ %d: %s\n", i + 1, net::savedSsid(i).c_str());
+    } else if (!strcmp(tok[1], "setup")) {
+      net::openPortal();
+    } else if (!strcmp(tok[1], "forget")) {
+      net::forgetAll();
+    } else {
+      Serial.println(F("wifi: dùng 'wifi', 'wifi setup' hoặc 'wifi forget'"));
+    }
+  } else if (!strcmp(c, "hist")) {
+    if (n == 1) {
+      Serial.printf("  flash: %s | %d ngày | %d mẫu trong RAM | dùng %u/%u KB\n",
+                    history::flashOk() ? "OK" : "LỖI", history::storedDays(), history::count(),
+                    (unsigned)(history::usedBytes() / 1024), (unsigned)(history::totalBytes() / 1024));
+    } else if (!strcmp(tok[1], "clear")) {
+      history::clear();
+#ifdef SMARTROOM_TEST
+    } else if (!strcmp(tok[1], "fill") && n >= 3) {
+      // chỉ để thử: tạo <n> mẫu giả cách nhau 5 phút, kết thúc ở hiện tại
+      uint32_t t = (uint32_t)time(nullptr), t0 = millis();
+      for (int k = atoi(tok[2]) - 1; k >= 0; k--) history::add({t - (uint32_t)k * 300UL, (int16_t)(250 + k % 80), (uint8_t)(60 + k % 30), (uint16_t)(k % 4096)});
+      Serial.printf("[test] đã tạo xong trong %lu ms\n", (unsigned long)(millis() - t0));
+    } else if (!strcmp(tok[1], "fake") && n >= 3) {
+      // chỉ để thử: tạo mỗi ngày một mẫu giả cho <n> ngày trước
+      uint32_t t = (uint32_t)time(nullptr);
+      for (int k = atoi(tok[2]); k >= 1; k--) history::add({t - (uint32_t)k * 86400UL, 250, 50, 1000});
+      Serial.printf("[test] đã tạo dữ liệu giả, còn %d ngày\n", history::storedDays());
+#endif
+    } else {
+      Serial.println(F("hist: dùng 'hist' hoặc 'hist clear'"));
+    }
+#ifdef SMARTROOM_TEST
+  } else if (!strcmp(c, "blackout") && n >= 2) {
+    if (n >= 3 && !strcmp(tok[2], "boot")) net::testBlackoutAtBoot(atoi(tok[1]));
+    else net::testBlackout(atoi(tok[1]));
+  } else if (!strcmp(c, "cloud") && n >= 2) {
+    if (!strcmp(tok[1], "expire")) {
+      remote::testExpireToken();
+      Serial.println(F("[test] buộc làm mới phiên đăng nhập"));
+    } else {
+      bool changed = false;
+      String r = runRemoteCommand(String(tok[1]), &changed);
+      Serial.printf("[test] cloud (changed=%d, %u byte): %s\n", changed ? 1 : 0, r.length(), r.c_str());
+    }
+#endif
   } else if (!strcmp(c, "reboot")) {
     Serial.println(F("Khởi động lại..."));
     delay(200);
@@ -1086,6 +1365,7 @@ void setup() {
   printSlots();
 
   dht.begin();
+  history::begin();
 
   // RTC (I2C)
   // Kiểm tra bus trước: lúc rảnh SDA và SCL phải ở mức cao. Nếu bị giữ thấp
@@ -1124,14 +1404,9 @@ void setup() {
   configTzTime(TZ_VIETNAM, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
   loadTimeFromRtc();
 
-  // Wi-Fi
-  WiFi.mode(WIFI_STA);
-  WiFi.persistent(false);
-  WiFi.setAutoReconnect(true);
-  WiFi.setHostname(DEVICE_HOSTNAME);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  g_lastWifiAttemptMs = millis();
-  Serial.printf("[wifi] đang kết nối tới \"%s\"...\n", WIFI_SSID);
+  // Wi-Fi + web (web chạy ngay để dùng được cả khi chỉ có Wi-Fi riêng)
+  net::begin();
+  setupWeb();
 
   Serial.println(F("Gõ 'help' để xem lệnh kiểm thử."));
 }
@@ -1139,17 +1414,18 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  handleWifi(now);
-  if (g_servicesStarted) {
-    ArduinoOTA.handle();
-    server.handleClient();
-  }
+  net::poll(now);
+  handleServices();
+  if (g_otaStarted) ArduinoOTA.handle();
+  server.handleClient();
+  now = millis();                    // phần mạng / web có thể tốn thời gian
   handleSerial();
   handleSensor(now);
   handleLight(now);
   handleHistory(now);
   handleRtcSync();
   updateOutputs(now);
+  handleRemote(now);
   updateStatusLed(now);
   updateLcd(now);
 
